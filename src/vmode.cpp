@@ -11,16 +11,91 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
-#include <QLockFile>
 #include <QLocalSocket>
+#include <QPluginLoader>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QScreen>
 #include <QScrollArea>
 #include <QStandardPaths>
-#include <QTabWidget>
+#include <QSysInfo>
 #include <QTabBar>
+#include <QTabWidget>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#ifdef WETYPE_LAYER_SHELL
+#include <LayerShellQt/Window>
+#include <wayland-client.h>
+#endif
+
+#ifdef WETYPE_LAYER_SHELL
+static bool layerShellPluginAvailable() {
+  for (const auto &path : QCoreApplication::libraryPaths()) {
+    const QDir directory(path + "/wayland-shell-integration");
+    for (const auto &file : directory.entryList(QDir::Files)) {
+      QPluginLoader plugin(directory.filePath(file));
+      const auto keys = plugin.metaData()
+                            .value("MetaData")
+                            .toObject()
+                            .value("Keys")
+                            .toArray();
+      for (const auto &key : keys)
+        if (key.toString() == "layer-shell" && plugin.load())
+          return true;
+    }
+  }
+  return false;
+}
+#endif
+
+static bool prepareLayerShell() {
+  const auto platform = qgetenv("QT_QPA_PLATFORM");
+  const bool wayland =
+      platform.startsWith("wayland") ||
+      (platform.isEmpty() &&
+       (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY") ||
+        qEnvironmentVariable("XDG_SESSION_TYPE") == "wayland"));
+  if (!wayland)
+    return false;
+#ifdef WETYPE_LAYER_SHELL
+  // Probe before selecting the Qt shell plugin: unsupported compositors must
+  // not be forced to use layer-shell (e.g. GNOME's xdg-shell-only sessions).
+  if (layerShellPluginAvailable()) {
+    if (auto *display = wl_display_connect(nullptr)) {
+      bool supported = false;
+      auto *registry = wl_display_get_registry(display);
+      static const wl_registry_listener listener{
+          [](void *data, wl_registry *, uint32_t, const char *name, uint32_t) {
+            if (QByteArray(name) == "zwlr_layer_shell_v1")
+              *static_cast<bool *>(data) = true;
+          },
+          [](void *, wl_registry *, uint32_t) {}};
+      wl_registry_add_listener(registry, &listener, &supported);
+      const bool ready = wl_display_roundtrip(display) >= 0;
+      wl_registry_destroy(registry);
+      wl_display_disconnect(display);
+      if (ready && supported) {
+        qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
+        if (platform.isEmpty())
+          qputenv("QT_QPA_PLATFORM", "wayland");
+        return true;
+      }
+    }
+  } else {
+    std::fputs("WeTypeX: layer-shell Qt runtime plugin is not installed.\n",
+               stderr);
+  }
+#endif
+  std::fputs("WeTypeX: layer-shell unavailable; using the Fcitx tools menu.\n",
+             stderr);
+  return false;
+}
 
 static QString stateDir() {
   const auto override = qEnvironmentVariable("WETYPE_STATE_DIR");
@@ -115,13 +190,59 @@ static QPushButton *menuButton(const QString &title, const QString &icon) {
   return button;
 }
 int main(int argc, char **argv) {
+  const bool layerShell = prepareLayerShell();
+  const auto platform = qgetenv("QT_QPA_PLATFORM");
+  const bool wayland =
+      platform.startsWith("wayland") ||
+      (platform.isEmpty() &&
+       (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY") ||
+        qEnvironmentVariable("XDG_SESSION_TYPE") == "wayland"));
+  // Tell the input-method plugin to use its own candidate surface. Never map
+  // an ordinary Wayland toplevel that could steal the original client's focus.
+  if (wayland && !layerShell)
+    return 69;
   QApplication app(argc, argv);
   app.setApplicationName("fcitx5-wetypex-vmode");
-  QDir().mkpath(stateDir());
-  QLockFile lock(stateDir() + "/vmode.lock");
-  lock.setStaleLockTime(0);
-  if (!lock.tryLock())
-    return 0;
+  std::fprintf(stderr, "WeTypeX V toolbar: %s%s\n",
+               app.platformName().toUtf8().constData(),
+               layerShell ? " / layer-shell, keyboard focus disabled" : "");
+  if (!QDir().mkpath(stateDir()))
+    return 73;
+  // Keep the inode in place. Kernel ownership, rather than a PID saved on
+  // disk, determines whether an instance is alive, including after SIGKILL.
+  QFile lock(stateDir() + "/vmode.lock");
+  const int fd = ::open(QFile::encodeName(lock.fileName()).constData(),
+                        O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (fd < 0) {
+    std::perror("WeTypeX V toolbar lock");
+    return 73;
+  }
+  if (!lock.open(fd, QIODevice::ReadWrite, QFileDevice::AutoCloseHandle)) {
+    ::close(fd);
+    return 73;
+  }
+  int locked;
+  do {
+    locked = ::flock(fd, LOCK_EX | LOCK_NB);
+  } while (locked < 0 && errno == EINTR);
+  if (locked < 0) {
+    if (errno == EWOULDBLOCK || errno == EAGAIN)
+      return 0;
+    std::perror("WeTypeX V toolbar flock");
+    return 73;
+  }
+  // Retain QLockFile's metadata layout so a running older installation also
+  // respects this lock, and can recover it after a downgrade or forced exit.
+  const auto info = QByteArray::number(app.applicationPid()) + '\n' +
+                    app.applicationName().toUtf8() + '\n' +
+                    QSysInfo::machineHostName().toUtf8() + '\n' +
+                    QSysInfo::machineUniqueId() + '\n' +
+                    QSysInfo::bootUniqueId() + '\n';
+  if (!lock.resize(0) || lock.write(info) != info.size()) {
+    std::fputs("WeTypeX: cannot write V toolbar lock metadata.\n", stderr);
+    return 73;
+  }
+  lock.flush();
   quint64 session =
       argc > 1 ? QString::fromLocal8Bit(argv[1]).toULongLong() : 0;
   int x = argc > 2 ? QString::fromLocal8Bit(argv[2]).toInt() : 0;
@@ -129,6 +250,28 @@ int main(int argc, char **argv) {
   const auto epoch = argc > 4 ? QString::fromLocal8Bit(argv[4]).toULongLong() : 0;
   const auto token = argc > 5 ? QString::fromLocal8Bit(argv[5]) : QString();
   VModeWindow window(session, epoch, token);
+#ifdef WETYPE_LAYER_SHELL
+  if (layerShell && app.platformName().startsWith("wayland")) {
+    window.winId();
+    auto *screen = app.screenAt(QPoint(x, y));
+    if (!screen)
+      screen = app.primaryScreen();
+    window.windowHandle()->setScreen(screen);
+    auto *surface = LayerShellQt::Window::get(window.windowHandle());
+    surface->setLayer(LayerShellQt::Window::LayerOverlay);
+    surface->setKeyboardInteractivity(
+        LayerShellQt::Window::KeyboardInteractivityNone);
+    surface->setAnchors(
+        LayerShellQt::Window::Anchors(LayerShellQt::Window::AnchorTop) |
+        LayerShellQt::Window::AnchorLeft);
+    surface->setExclusiveZone(-1);
+    const auto origin = screen ? screen->geometry().topLeft() : QPoint();
+    surface->setMargins(QMargins(std::max(0, x - origin.x()),
+                                 std::max(0, y - origin.y()), 0, 0));
+  }
+#else
+  Q_UNUSED(layerShell);
+#endif
   window.setWindowTitle("WeTypeX 快捷工具");
   window.setStyleSheet(
       "QWidget{background:#f7f7f7;color:#202124;font:14px 'Noto Sans CJK SC';}"

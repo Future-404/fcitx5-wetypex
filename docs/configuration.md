@@ -22,6 +22,7 @@ ${XDG_CONFIG_HOME:-$HOME/.config}/fcitx5/wetypex.json
 - 候选字号：10–18。
 - 每页候选：3–9。
 - 排列方式：横排或竖排。
+- 候选序号样式：默认“微信风格”（`1输入`），也可选择“Fcitx 默认”（由主题渲染 `1. 输入`）。完整设置与 Fcitx5 配置页共用 JSON 字段 `candidate_label_style`，值为 `wetype` 或 `fcitx`。此选项只控制显示，数字选词与翻页按键保持一致。
 - 主题：跟随系统、浅色、深色。
 
 外观设置会更新 Fcitx5 Classic UI 的 WeTypeX 主题项。其他输入法共用同一个 Classic UI 时，主题切换也会影响其候选窗口。

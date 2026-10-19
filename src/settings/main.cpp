@@ -1103,6 +1103,30 @@ int main(int argc, char **argv) {
                                                                      : 1;
   theme->setCurrentIndex(themeMode);
   visual.body->addWidget(rowsCard({row("主题模式", {}, theme, 48)}));
+  auto *labelStyle = new QComboBox;
+  labelStyle->addItems({"微信风格", "Fcitx 默认"});
+  labelStyle->setCurrentIndex(
+      settings.value("candidate_label_style").toString() == "fcitx" ? 1 : 0);
+  visual.body->addWidget(
+      rowsCard({row("候选序号样式", "微信风格：1输入；Fcitx 默认：1. 输入",
+                    labelStyle, 64)}));
+  auto updatePreview = [=] {
+    preview->setText(
+        labelStyle->currentIndex() == 1
+            ? "<span style='background:#13b77a;color:white;padding:5px'>1. "
+              "输入</span>　2. 输入法　3. 诗心　4. 为新　5. 唯心"
+            : "<span "
+              "style='background:#13b77a;color:white;padding:5px'>1输入</"
+              "span>　2输入法　3诗心　4为新　5唯心");
+  };
+  updatePreview();
+  QObject::connect(labelStyle, qOverload<int>(&QComboBox::currentIndexChanged),
+                   [=](int index) {
+                     writeSetting("candidate_label_style",
+                                  index == 1 ? QStringLiteral("fcitx")
+                                             : QStringLiteral("wetype"));
+                     updatePreview();
+                   });
   auto *appearanceStatus = new QLabel;
   appearanceStatus->setObjectName("rowSubtitle");
   visual.body->addWidget(appearanceStatus);

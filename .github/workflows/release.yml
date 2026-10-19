@@ -67,7 +67,7 @@ jobs:
             archlinux:base-devel bash -euc '
               pacman -Syu --noconfirm git cmake clang boost fcitx5 fcitx5-qt libime libc++ \
                 json-c curl bubblewrap util-linux python qt6-base qt6-svg \
-                qt6-webengine pipewire ffmpeg wl-clipboard libnotify polkit
+                qt6-webengine layer-shell-qt pipewire ffmpeg wl-clipboard libnotify polkit
               useradd -m builder
               cp -a /src/dist/arch /tmp/arch
               chown -R builder:builder /tmp/arch

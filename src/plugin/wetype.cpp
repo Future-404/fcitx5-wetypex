@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <clipboard_public.h>
 #include <csignal>
+#include <cstring>
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/key.h>
@@ -35,12 +36,12 @@
 #include <spawn.h>
 #include <string>
 #include <string_view>
-#include <type_traits>
-#include <utility>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <type_traits>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 extern char **environ;
 namespace {
@@ -203,6 +204,7 @@ struct DeferredKey {
   bool release;
   int time;
 };
+enum class VMenu { None, Main, Clipboard, Hotwords, SymbolGroups, Symbols };
 struct State : InputContextProperty {
   uint64_t id, epoch = 1, seq = 0, applied = 0, revision = 0, inputSeq = 0;
   uint64_t cloudPollUntil = 0, lastCloudPoll = 0;
@@ -220,6 +222,10 @@ struct State : InputContextProperty {
        englishPunctuation = false, vMode = false;
   bool selectionPending = false;
   std::vector<DeferredKey> deferredKeys;
+  VMenu vMenu = VMenu::None;
+  uint64_t vMenuGeneration = 0;
+  std::string vMenuTitle;
+  std::vector<std::pair<std::string, std::string>> vMenuEntries;
   bool active = false;
   KeySym modifierCandidate = FcitxKey_None;
   TrackableObjectReference<InputContext> ic;
@@ -242,7 +248,20 @@ public:
         revision_(revision) {}
   void select(InputContext *ic) const override;
 };
+class VMenuWord : public CandidateWord {
+  WeType *engine_;
+  size_t index_;
+  uint64_t generation_, epoch_, session_;
+
+public:
+  VMenuWord(WeType *engine, std::string text, size_t index, uint64_t generation,
+            uint64_t epoch, uint64_t session)
+      : CandidateWord(Text(text)), engine_(engine), index_(index),
+        generation_(generation), epoch_(epoch), session_(session) {}
+  void select(InputContext *ic) const override;
+};
 class WeType : public InputMethodEngine {
+  friend class VMenuWord;
   Instance *instance_;
   uint64_t nextId_ = 0;
   FactoryFor<State> factory_;
@@ -262,6 +281,7 @@ class WeType : public InputMethodEngine {
   pid_t vModeChild_ = -1;
   uint64_t vModeSession_ = 0, vModeEpoch_ = 0, vModeGeneration_ = 0;
   std::string vModeToken_;
+  bool vModeNative_ = false;
   std::string inbound_, outbound_;
   bool voiceRecording_ = false, voiceHold_ = false;
   uint64_t voiceSession_ = 0, voiceEpoch_ = 0;
@@ -534,6 +554,10 @@ class WeType : public InputMethodEngine {
     appearance->candidateSize.setValue(
         std::clamp(int(wire::number(j.get(), "candidate_size", 13)), 10, 18));
     appearance->vertical.setValue(vertical_);
+    appearance->labelStyle.setValue(
+        wire::str(j.get(), "candidate_label_style") == "fcitx"
+            ? wetype_config::CandidateLabelStyle::Fcitx
+            : wetype_config::CandidateLabelStyle::WeType);
     appearance->theme.setValue(static_cast<wetype_config::ThemeMode>(
         std::clamp(int(wire::number(j.get(), "theme_mode", 0)), 0, 2)));
     auto *devices = config_.devices.mutableValue();
@@ -674,6 +698,11 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "page_size", int64_t(*appearance.pageSize));
     wire::put(json.get(), "candidate_size", int64_t(*appearance.candidateSize));
     wire::put(json.get(), "vertical", bool(*appearance.vertical));
+    wire::put(json.get(), "candidate_label_style",
+              std::string(*appearance.labelStyle ==
+                                  wetype_config::CandidateLabelStyle::Fcitx
+                              ? "fcitx"
+                              : "wetype"));
     wire::put(json.get(), "theme_mode", int64_t(*appearance.theme));
     wire::put(json.get(), "clipboard_enabled",
               bool(config_.phrases->clipboard.value()));
@@ -906,7 +935,155 @@ class WeType : public InputMethodEngine {
     if (s->active && s->epoch == epoch)
       ic->commitString(text);
   }
-  void stopVModeWindow() {
+  static void clearVMenu(State *s) {
+    s->vMenu = VMenu::None;
+    ++s->vMenuGeneration;
+    s->vMenuEntries.clear();
+    s->vMenuTitle.clear();
+  }
+  static wire::Json menuFile(const std::filesystem::path &path) {
+    std::ifstream input(path);
+    std::string bytes(1048577, '\0');
+    input.read(bytes.data(), bytes.size());
+    bytes.resize(input.gcount());
+    return bytes.size() > 1048576 ? wire::Json{} : wire::parse(bytes);
+  }
+  void nativeVMenu(InputContext *ic, VMenu kind, std::string title,
+                   std::vector<std::pair<std::string, std::string>> entries) {
+    auto *s = state(ic);
+    s->vMenu = kind;
+    ++s->vMenuGeneration;
+    s->vMenuTitle = std::move(title);
+    s->vMenuEntries = std::move(entries);
+    auto list = std::make_unique<CommonCandidateList>();
+    list->setPageSize(pageSize_);
+    list->setCursorPositionAfterPaging(CursorPositionAfterPaging::ResetToFirst);
+    const bool nativeLabels = *config_.appearance->labelStyle ==
+                              wetype_config::CandidateLabelStyle::Fcitx;
+    list->setSelectionKey(nativeLabels && kind != VMenu::Main
+                              ? Key::keyListFromString("1 2 3 4 5 6 7 8 9")
+                              : KeyList{});
+    list->setLayoutHint(vertical_ ? CandidateLayoutHint::Vertical
+                                  : CandidateLayoutHint::Horizontal);
+    for (size_t i = 0; i < std::min<size_t>(s->vMenuEntries.size(), 5000);
+         ++i) {
+      const auto &text = s->vMenuEntries[i].first;
+      size_t end = std::min<size_t>(text.size(), 120);
+      while (end < text.size() && end &&
+             (static_cast<unsigned char>(text[end]) & 0xc0) == 0x80)
+        --end;
+      auto display = text.substr(0, end);
+      std::replace(display.begin(), display.end(), '\n', ' ');
+      std::replace(display.begin(), display.end(), '\r', ' ');
+      if (end < text.size())
+        display += "…";
+      if (!nativeLabels && kind != VMenu::Main)
+        display = std::to_string(i % pageSize_ + 1) + display;
+      list->append<VMenuWord>(this, std::move(display), i, s->vMenuGeneration,
+                              s->epoch, s->id);
+    }
+    s->candidatePage = s->candidateCursor = 0;
+    if (list->totalSize()) {
+      list->setPage(0);
+      list->setGlobalCursorIndex(0);
+    }
+    ic->inputPanel().setCandidateList(std::move(list));
+    panel(ic, s);
+  }
+  void mainVMenu(InputContext *ic) {
+    nativeVMenu(ic, VMenu::Main, "快捷工具（数字计算，空格选择）",
+                {{"计算", "calculator"},
+                 {"剪贴板", "clipboard"},
+                 {"常用语", "hotwords"},
+                 {"符号", "symbols"}});
+  }
+  void symbolVMenu(InputContext *ic, int groupIndex = -1) {
+    auto json = menuFile(WETYPE_SYMBOLS);
+    std::vector<std::pair<std::string, std::string>> entries;
+    std::string title = "符号";
+    if (json && json_object_is_type(json.get(), json_type_array)) {
+      if (groupIndex < 0) {
+        for (size_t i = 0; i < json_object_array_length(json.get()); ++i) {
+          auto *group = json_object_array_get_idx(json.get(), i);
+          entries.emplace_back(wire::str(group, "groupName"),
+                               std::to_string(i));
+        }
+      } else if (size_t(groupIndex) < json_object_array_length(json.get())) {
+        auto *group = json_object_array_get_idx(json.get(), groupIndex);
+        title = wire::str(group, "groupName");
+        auto *subgroups = wire::get(group, "groupData");
+        if (subgroups && json_object_is_type(subgroups, json_type_array))
+          for (size_t i = 0; i < json_object_array_length(subgroups); ++i) {
+            auto *rows = wire::get(json_object_array_get_idx(subgroups, i),
+                                   "subGroupData");
+            if (!rows || !json_object_is_type(rows, json_type_array))
+              continue;
+            for (size_t r = 0; r < json_object_array_length(rows); ++r) {
+              auto *row = json_object_array_get_idx(rows, r);
+              if (!row || !json_object_is_type(row, json_type_array))
+                continue;
+              for (size_t n = 0; n < json_object_array_length(row); ++n) {
+                auto *symbol = json_object_array_get_idx(row, n);
+                if (json_object_is_type(symbol, json_type_string)) {
+                  std::string text = json_object_get_string(symbol);
+                  entries.emplace_back(text, text);
+                }
+              }
+            }
+          }
+      }
+    }
+    nativeVMenu(ic, groupIndex < 0 ? VMenu::SymbolGroups : VMenu::Symbols,
+                title + "（退格返回）", std::move(entries));
+  }
+  void selectVMenu(InputContext *ic, size_t index, uint64_t generation,
+                   uint64_t epoch, uint64_t session) {
+    auto *s = state(ic);
+    if (!s->active || !ic->hasFocus() || !s->vMode || s->epoch != epoch ||
+        s->id != session || s->vMenu == VMenu::None ||
+        s->vMenuGeneration != generation || index >= s->vMenuEntries.size() ||
+        ic->capabilityFlags().test(CapabilityFlag::Password))
+      return;
+    const auto value = s->vMenuEntries[index].second;
+    if (s->vMenu == VMenu::Main) {
+      if (value == "calculator") {
+        stopVModeWindow();
+        ic->inputPanel().reset();
+        panel(ic, s);
+      } else if (value == "clipboard") {
+        auto json = menuFile(stateDirectory() / "clipboard-history.json");
+        std::vector<std::pair<std::string, std::string>> entries;
+        if (json && json_object_is_type(json.get(), json_type_array))
+          for (size_t i = 0; i < json_object_array_length(json.get()); ++i) {
+            auto *item = json_object_array_get_idx(json.get(), i);
+            if (json_object_is_type(item, json_type_string)) {
+              std::string text = json_object_get_string(item);
+              if (!text.empty() && text.size() <= 16384)
+                entries.emplace_back(text, text);
+            }
+          }
+        nativeVMenu(ic, VMenu::Clipboard, "剪贴板（退格返回）",
+                    std::move(entries));
+      } else if (value == "hotwords") {
+        nativeVMenu(ic, VMenu::Hotwords, "常用语（退格返回）", {});
+        send(ic, "hotword_list");
+      } else if (value == "symbols")
+        symbolVMenu(ic);
+    } else if (s->vMenu == VMenu::SymbolGroups) {
+      symbolVMenu(ic, int(index));
+    } else if (!value.empty() && value.size() <= 65536) {
+      cancelVMode(ic);
+      ic->commitString(value);
+    }
+  }
+  void stopVModeWindow(const char *reason = "toolbar closed") {
+    if (vModeSession_) {
+      const auto it = contexts_.find(vModeSession_);
+      if (it != contexts_.end() && it->second.get())
+        clearVMenu(it->second.get()->propertyFor(&factory_));
+      std::ofstream log(stateDirectory() / "vmode.log", std::ios::app);
+      log << "V toolbar closed: " << reason << '\n';
+    }
     pid_t exited = -1;
     if (vModeChild_ > 0) {
       do {
@@ -921,11 +1098,12 @@ class WeType : public InputMethodEngine {
     vModeChild_ = -1;
     vModeSession_ = vModeEpoch_ = 0;
     vModeToken_.clear();
+    vModeNative_ = false;
   }
-  void cancelVMode(InputContext *ic) {
+  void cancelVMode(InputContext *ic, const char *reason = "V mode cancelled") {
     auto *s = state(ic);
     if (vModeSession_ == s->id)
-      stopVModeWindow();
+      stopVModeWindow(reason);
     ++s->epoch;
     send(ic, "reset");
     s->vMode = false;
@@ -963,15 +1141,21 @@ class WeType : public InputMethodEngine {
                                      O_RDONLY, 0);
     posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null",
                                      O_WRONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null",
-                                     O_WRONLY, 0);
+    const auto logPath = (stateDirectory() / "vmode.log").string();
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, logPath.c_str(),
+                                     O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+                                     0600);
     pid_t child = -1;
     const int result = posix_spawn(&child, WETYPE_VMODE, &actions, nullptr,
                                    argv.data(), environ);
     posix_spawn_file_actions_destroy(&actions);
     if (result) {
-      stopVModeWindow();
-      return false;
+      std::ofstream log(logPath, std::ios::app);
+      log << "V toolbar spawn failed: " << std::strerror(result) << '\n';
+      vModeChild_ = -1;
+      vModeNative_ = true;
+      mainVMenu(ic);
+      return true;
     }
     vModeChild_ = child;
     return true;
@@ -1018,7 +1202,7 @@ class WeType : public InputMethodEngine {
   void pollVModeWindow() {
     // Consume a button action before reaping the window that wrote it.
     receiveVModeAction();
-    if (vModeChild_ <= 0)
+    if (vModeChild_ <= 0 && !vModeNative_)
       return;
     const auto it = contexts_.find(vModeSession_);
     auto *ic = it == contexts_.end() ? nullptr : it->second.get();
@@ -1027,13 +1211,32 @@ class WeType : public InputMethodEngine {
       return;
     }
     auto *s = state(ic);
-    const auto exited = waitpid(vModeChild_, nullptr, WNOHANG);
+    int status = 0;
+    const auto exited =
+        vModeChild_ > 0 ? waitpid(vModeChild_, &status, WNOHANG) : 0;
+    const bool fallback =
+        exited > 0 && exited == vModeChild_ && WIFEXITED(status) &&
+        (WEXITSTATUS(status) == 69 || WEXITSTATUS(status) == 127);
     if (exited == vModeChild_ || (exited < 0 && errno == ECHILD))
       vModeChild_ = -1;
-    if (vModeChild_ <= 0 || !ic->hasFocus() || !s->active || !s->vMode ||
-        s->epoch != vModeEpoch_ ||
-        ic->capabilityFlags().test(CapabilityFlag::Password))
-      cancelVMode(ic);
+    if (fallback && ic->hasFocus() && s->active && s->vMode &&
+        s->epoch == vModeEpoch_ &&
+        !ic->capabilityFlags().test(CapabilityFlag::Password)) {
+      vModeNative_ = true;
+      mainVMenu(ic);
+      return;
+    }
+    if ((vModeChild_ <= 0 && !vModeNative_) || !ic->hasFocus() || !s->active ||
+        !s->vMode || s->epoch != vModeEpoch_ ||
+        ic->capabilityFlags().test(CapabilityFlag::Password)) {
+      const auto *reason = vModeChild_ <= 0 && !vModeNative_ ? "process exited"
+                           : !ic->hasFocus() ? "input context lost focus"
+                           : !s->active      ? "input method deactivated"
+                           : !s->vMode       ? "V mode ended"
+                           : s->epoch != vModeEpoch_ ? "input session changed"
+                                                     : "password input context";
+      cancelVMode(ic, reason);
+    }
   }
   State *state(InputContext *ic) {
     auto *s = ic->propertyFor(&factory_);
@@ -1041,7 +1244,8 @@ class WeType : public InputMethodEngine {
     return s;
   }
   void panel(InputContext *ic, State *s) {
-    ic->inputPanel().setAuxUp(Text());
+    ic->inputPanel().setAuxUp(s->vMenu == VMenu::None ? Text()
+                                                      : Text(s->vMenuTitle));
     const std::string displayed =
         !s->displayPreedit.empty() ? s->displayPreedit
         : !s->vMode && *config_.input->mode == wetype_config::InputMode::Pinyin
@@ -1073,7 +1277,7 @@ class WeType : public InputMethodEngine {
     ic->updateUserInterface(UserInterfaceComponent::InputPanel);
   }
   void stop() {
-    stopVModeWindow();
+    stopVModeWindow("input backend stopped");
     reader_.reset();
     writer_.reset();
     if (read_ >= 0)
@@ -1116,6 +1320,7 @@ class WeType : public InputMethodEngine {
         s->cursor = 0;
         clearDisplayState(s);
         s->vMode = false;
+        clearVMenu(s);
         s->cloudPollUntil = 0;
         s->pendingPairKey = 0;
         s->pendingPairRight.clear();
@@ -1352,6 +1557,21 @@ class WeType : public InputMethodEngine {
     if (!s->active || !ic->hasFocus() ||
         ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
+    if (s->vMenu != VMenu::None) {
+      auto *words = wire::get(j.get(), "hotwords");
+      if (s->vMenu == VMenu::Hotwords && seq == s->seq && words &&
+          json_object_is_type(words, json_type_array)) {
+        std::vector<std::pair<std::string, std::string>> entries;
+        for (size_t i = 0; i < json_object_array_length(words); ++i) {
+          auto text = wire::str(json_object_array_get_idx(words, i), "words");
+          if (!text.empty())
+            entries.emplace_back(text, text);
+        }
+        nativeVMenu(ic, VMenu::Hotwords, "常用语（退格返回）",
+                    std::move(entries));
+      }
+      return;
+    }
     auto *commits = wire::get(j.get(), "commits");
     if (commits && json_object_is_type(commits, json_type_array))
       for (size_t i = 0; i < json_object_array_length(commits); i++) {
@@ -1396,9 +1616,10 @@ class WeType : public InputMethodEngine {
     auto list = std::make_unique<CommonCandidateList>();
     list->setPageSize(pageSize_);
     list->setCursorPositionAfterPaging(CursorPositionAfterPaging::ResetToFirst);
-    // The Windows candidate bar renders the page-local digit as part of each
-    // candidate ("1测试"), without Fcitx's default "1. 测试" label.
-    list->setSelectionKey({});
+    const bool nativeLabels = *config_.appearance->labelStyle ==
+                              wetype_config::CandidateLabelStyle::Fcitx;
+    list->setSelectionKey(
+        nativeLabels ? Key::keyListFromString("1 2 3 4 5 6 7 8 9") : KeyList{});
     list->setLayoutHint(vertical_ ? CandidateLayoutHint::Vertical
                                   : CandidateLayoutHint::Horizontal);
     auto *candidates = wire::get(j.get(), "candidates");
@@ -1411,7 +1632,8 @@ class WeType : public InputMethodEngine {
         if (json_object_is_type(v, json_type_string) &&
             json_object_get_string_len(v)) {
           std::string display =
-              std::to_string(list->totalSize() % pageSize_ + 1);
+              nativeLabels ? std::string{}
+                           : std::to_string(list->totalSize() % pageSize_ + 1);
           display += json_object_get_string(v);
           list->append<Word>(this, std::move(display), i, s->revision);
         }
@@ -1566,7 +1788,9 @@ public:
     auto *ic = e.inputContext();
     auto *s = state(ic);
     if (vModeSession_ == s->id)
-      stopVModeWindow();
+      stopVModeWindow(s->active ? "input context reset"
+                                : "input method deactivated");
+    clearVMenu(s);
     s->selectionPending = false;
     s->deferredKeys.clear();
     ++s->epoch;
@@ -1817,7 +2041,7 @@ public:
       }
       return;
     }
-    bool composing = !s->preedit.empty();
+    bool composing = !s->preedit.empty() || s->vMenu != VMenu::None;
     if (!composing)
       recordClipboard(ic);
     if (failed_) {
@@ -1832,6 +2056,24 @@ public:
       }
       return;
     }
+    bool pageDown =
+        sym == FcitxKey_Page_Down ||
+        key.checkKeyList(instance_->globalConfig().defaultNextPage()) ||
+        key.checkKeyList(*config_.shortcuts->nextPageKeys) ||
+        (*config_.shortcuts->pageMinusEqual && sym == FcitxKey_equal) ||
+        (*config_.shortcuts->pageBrackets && sym == FcitxKey_bracketright) ||
+        (*config_.shortcuts->pageCommaPeriod && sym == FcitxKey_period) ||
+        (*config_.shortcuts->pageShiftTab &&
+         !key.states().test(KeyState::Shift) && sym == FcitxKey_Tab);
+    bool pageUp =
+        sym == FcitxKey_Page_Up ||
+        key.checkKeyList(instance_->globalConfig().defaultPrevPage()) ||
+        key.checkKeyList(*config_.shortcuts->previousPageKeys) ||
+        (*config_.shortcuts->pageMinusEqual && sym == FcitxKey_minus) ||
+        (*config_.shortcuts->pageBrackets && sym == FcitxKey_bracketleft) ||
+        (*config_.shortcuts->pageCommaPeriod && sym == FcitxKey_comma) ||
+        (*config_.shortcuts->pageShiftTab &&
+         key.states().test(KeyState::Shift) && sym == FcitxKey_Tab);
     auto *list = dynamic_cast<CommonCandidateList *>(
         ic->inputPanel().candidateList().get());
     if (s->vMode &&
@@ -1841,6 +2083,43 @@ public:
       cancelVMode(ic);
       e.filterAndAccept();
       return;
+    }
+    if (s->vMenu != VMenu::None) {
+      if (list && list->totalSize() &&
+          (sym == FcitxKey_Up || sym == FcitxKey_Down)) {
+        if (sym == FcitxKey_Up)
+          list->prevCandidate();
+        else
+          list->nextCandidate();
+        s->candidatePage = list->currentPage();
+        s->candidateCursor = list->globalCursorIndex();
+        ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+        e.filterAndAccept();
+        return;
+      }
+      if (sym == FcitxKey_BackSpace) {
+        mainVMenu(ic);
+        e.filterAndAccept();
+        return;
+      }
+      if (sym == FcitxKey_space || sym == FcitxKey_Return ||
+          sym == FcitxKey_KP_Enter ||
+          (s->vMenu != VMenu::Main && sym >= FcitxKey_1 && sym <= FcitxKey_9)) {
+        const int index = sym >= FcitxKey_1 && sym <= FcitxKey_9
+                              ? int(sym - FcitxKey_1)
+                          : list ? std::max(list->cursorIndex(), 0)
+                                 : 0;
+        if (list && index < list->size())
+          list->candidate(index).select(ic);
+        e.filterAndAccept();
+        return;
+      }
+      if (sym >= 0x20 && sym <= 0x7e &&
+          (s->vMenu == VMenu::Main || (!pageDown && !pageUp))) {
+        clearVMenu(s);
+        ic->inputPanel().reset();
+        composing = !s->preedit.empty();
+      }
     }
     if (!composing && !s->vMode && *config_.shortcuts->vMode &&
         key.checkKeyList(*config_.shortcuts->vModeKeys)) {
@@ -1859,7 +2138,7 @@ public:
       e.filterAndAccept();
       return;
     }
-    if (s->vMode && sym >= 0x20 && sym <= 0x7e) {
+    if (s->vMode && s->vMenu == VMenu::None && sym >= 0x20 && sym <= 0x7e) {
       if (vModeSession_ == s->id)
         stopVModeWindow();
       if (sym == FcitxKey_space) {
@@ -1913,24 +2192,6 @@ public:
       e.filterAndAccept();
       return;
     }
-    bool pageDown =
-        sym == FcitxKey_Page_Down ||
-        key.checkKeyList(instance_->globalConfig().defaultNextPage()) ||
-        key.checkKeyList(*config_.shortcuts->nextPageKeys) ||
-        (*config_.shortcuts->pageMinusEqual && sym == FcitxKey_equal) ||
-        (*config_.shortcuts->pageBrackets && sym == FcitxKey_bracketright) ||
-        (*config_.shortcuts->pageCommaPeriod && sym == FcitxKey_period) ||
-        (*config_.shortcuts->pageShiftTab &&
-         !key.states().test(KeyState::Shift) && sym == FcitxKey_Tab);
-    bool pageUp =
-        sym == FcitxKey_Page_Up ||
-        key.checkKeyList(instance_->globalConfig().defaultPrevPage()) ||
-        key.checkKeyList(*config_.shortcuts->previousPageKeys) ||
-        (*config_.shortcuts->pageMinusEqual && sym == FcitxKey_minus) ||
-        (*config_.shortcuts->pageBrackets && sym == FcitxKey_bracketleft) ||
-        (*config_.shortcuts->pageCommaPeriod && sym == FcitxKey_comma) ||
-        (*config_.shortcuts->pageShiftTab &&
-         key.states().test(KeyState::Shift) && sym == FcitxKey_Tab);
     if (composing && (pageDown || pageUp)) {
       if (list) {
         if (pageDown) {
@@ -2117,6 +2378,9 @@ public:
 };
 void Word::select(InputContext *ic) const {
   engine_->select(ic, index_, revision_);
+}
+void VMenuWord::select(InputContext *ic) const {
+  engine_->selectVMenu(ic, index_, generation_, epoch_, session_);
 }
 class Factory : public AddonFactory {
   AddonInstance *create(AddonManager *m) override {

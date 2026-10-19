@@ -179,6 +179,8 @@ fcitx5-wetypex-account sync-now     # 请求个人词库与常用语同步
 - `Ctrl + Win + Shift`：启动语音输入，再按任意键结束。
 - `Ctrl + Win`：按住说话，松开结束。
 
+外观中的“候选序号样式”可选择微信风格或 Fcitx 默认标签。Wayland 下的 V 工具栏优先使用 layer-shell 保持原输入框焦点；构建依赖与兼容回退见[故障排查](docs/troubleshooting.md#wayland-下-v-工具栏闪退或不显示)。
+
 所有快捷键、输入方式、候选数量、主题、模糊音和同步开关也会出现在 Fcitx5 自带的输入法配置页中；同一页面提供完整设置、账号与同步入口，采用与 Fcitx5 拼音词典管理器相同的 `ExternalOption` 扩展机制。配置项说明见[配置参考](docs/configuration.md)。
 
 ## 数据目录

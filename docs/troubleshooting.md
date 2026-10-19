@@ -69,6 +69,18 @@ pw-record --rate 16000 --channels 1 --format s16 /tmp/wetypex-test.wav
 
 录制几秒后按 `Ctrl+C`，确认 WAV 非空。随后检查 `state/voice/last-record.log`。识别需要联网、有效账户身份和 FFmpeg 的 Opus 编码器。
 
+## Wayland 下 V 工具栏闪退或不显示
+
+V 工具栏在支持 `zwlr_layer_shell_v1` 的 Wayland 合成器上使用不接收键盘焦点的 layer-shell 表面，避免打开工具栏时原输入框失焦。Arch 和 rpm 构建包含 Qt6 的 LayerShellQt；源码构建可用 `-DWETYPE_LAYER_SHELL=ON` 要求该支持，或用 `OFF` 禁用，默认 `AUTO` 按 SDK 可用性选择。运行时还会检查对应 Qt 主版本的 shell 插件是否存在。
+
+缺少匹配的 LayerShellQt 运行时或合成器不支持该协议时，工具栏回退到 Fcitx 原生候选菜单，不创建会抢焦点的普通 Wayland 窗口。主菜单提供计算、剪贴板、常用语与符号，可用鼠标或上下键加空格/回车选择；直接输入数字开始计算，保留 `v1+2` 的输入方式。子菜单支持数字选词与翻页，退格返回主菜单，V / Esc 关闭。
+
+标准 deb 使用 Qt5 并保留跨发行版基线；Ubuntu 26.04 和 Debian 13 已不再提供 Qt5 的 LayerShellQt，所以 deb 在 Wayland 会话使用原生候选菜单，避免新增不可解析的旧库依赖。Qt5.12 的 legacy 包采用相同回退。X11 会话仍使用独立工具栏；显式指定 `QT_QPA_PLATFORM=xcb` 时也保留该选择。原生 Wayland 的本机源码构建可安装匹配 Qt 主版本的 LayerShellQt 开发包、运行时 shell 插件及 `wayland-client`，启用独立工具栏。
+
+单实例守卫使用 `flock`。`state/vmode.lock` 文件保留在磁盘上，进程退出（包括 SIGTERM、SIGKILL）后内核自动释放锁；文件存在不表示工具栏仍在运行，无需手工删除。删除活实例使用的锁文件会破坏互斥，应先关闭工具栏。
+
+仍有异常时检查 `state/vmode.log`，其中记录最近一次启动使用的窗口协议、Qt 错误和轮询关闭原因，不记录输入内容。
+
 ## AI 窗口空白或缺图标
 
 重新提取界面资源：
