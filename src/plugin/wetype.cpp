@@ -559,6 +559,10 @@ class WeType : public InputMethodEngine {
     appearance->candidateSize.setValue(
         std::clamp(int(wire::number(j.get(), "candidate_size", 13)), 10, 18));
     appearance->vertical.setValue(vertical_);
+    appearance->preeditPosition.setValue(
+        wire::str(j.get(), "preedit_position") == "candidate"
+            ? wetype_config::PreeditPosition::Candidate
+            : wetype_config::PreeditPosition::Client);
     appearance->labelStyle.setValue(
         wire::str(j.get(), "candidate_label_style") == "fcitx"
             ? wetype_config::CandidateLabelStyle::Fcitx
@@ -703,6 +707,11 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "page_size", int64_t(*appearance.pageSize));
     wire::put(json.get(), "candidate_size", int64_t(*appearance.candidateSize));
     wire::put(json.get(), "vertical", bool(*appearance.vertical));
+    wire::put(json.get(), "preedit_position",
+              std::string(*appearance.preeditPosition ==
+                                  wetype_config::PreeditPosition::Candidate
+                              ? "candidate"
+                              : "client"));
     wire::put(json.get(), "candidate_label_style",
               std::string(*appearance.labelStyle ==
                                   wetype_config::CandidateLabelStyle::Fcitx
@@ -1311,6 +1320,8 @@ class WeType : public InputMethodEngine {
               : displayCursorForRaw(s->preedit, displayed, s->cursor));
     }
     const bool inlinePreedit =
+        *config_.appearance->preeditPosition !=
+            wetype_config::PreeditPosition::Candidate &&
         ic->capabilityFlags().test(CapabilityFlag::Preedit) &&
         ic->isPreeditEnabled();
     ic->inputPanel().setClientPreedit(inlinePreedit ? text : Text());
