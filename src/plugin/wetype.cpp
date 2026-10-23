@@ -1767,7 +1767,12 @@ public:
                *config_.shortcuts->shiftSwitch) ||
               ((sym == FcitxKey_Control_L || sym == FcitxKey_Control_R) &&
                *config_.shortcuts->ctrlSwitch);
-          if (!enabled)
+          // Leave multi-modifier shortcuts (e.g. Alt+Shift and the voice
+          // shortcut) to their normal handlers. Only own the bare modifier.
+          const auto otherModifiers =
+              key.key().states().toInteger() & uint32_t(KeyState::SimpleMask) &
+              ~Key::keySymToStates(sym).toInteger();
+          if (!enabled || key.filtered() || otherModifiers)
             return;
           auto *ic = key.inputContext();
           auto *entry = instance_->inputMethodEntry(ic);
